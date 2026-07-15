@@ -1,0 +1,19 @@
+# Normalize line endings: check out as-is, commit as LF. Keeps CSVs and
+# shell scripts portable while avoiding the noisy CRLF warnings on Windows.
+* text=auto eol=lf
+
+# Force LF for source and scripts regardless of platform.
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.hpp  text eol=lf
+*.sh   text eol=lf
+*.csv  text eol=lf
+*.md   text eol=lf
+
+# Windows batch must stay CRLF-friendly.
+*.bat  text eol=crlf
+
+# Binary.
+*.exe  binary
+*.o    binary
+*.obj  binary
