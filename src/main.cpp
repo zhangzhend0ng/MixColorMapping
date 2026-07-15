@@ -446,7 +446,10 @@ void emit_color_csv(std::ostream& os, cmb::RGB8 c) {
 }
 
 // Emit a recipe block to a JSON string (for serve mode).
-std::string recipe_to_json(const std::string& prefix, const cmb::MatchResult& r) {
+// Keys are prefix-less (type, ids, hex, R, G, B, L, a, b, C, M, Y, K, delta_e)
+// because each recipe sits inside its own "fs" / "prusa" object, so the prefix
+// would be redundant. This matches what the browser expects (row.fs.delta_e).
+std::string recipe_to_json(const cmb::MatchResult& r) {
     const char* type_str = !r.valid ? "none" : (r.type == cmb::MatchResult::Type::Pair ? "pair" : "triple");
     std::string ids, weights;
     for (size_t i = 0; i < r.ids.size(); ++i) { if (i) ids += "/"; ids += std::to_string(r.ids[i]); }
@@ -458,33 +461,30 @@ std::string recipe_to_json(const std::string& prefix, const cmb::MatchResult& r)
 
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-        "\"%s_type\":\"%s\",\"%s_ids\":\"%s\",\"%s_weights\":\"%s\","
-        "\"%s_hex\":\"%s\",\"%s_R\":%d,\"%s_G\":%d,\"%s_B\":%d,"
-        "\"%s_L\":%.4f,\"%s_a\":%.4f,\"%s_b\":%.4f,"
-        "\"%s_C\":%.4f,\"%s_M\":%.4f,\"%s_Y\":%.4f,\"%s_K\":%.4f,"
-        "\"%s_delta_e\":%.4f",
-        prefix.c_str(), type_str, prefix.c_str(), ids.c_str(), prefix.c_str(), weights.c_str(),
-        prefix.c_str(), r.valid ? cmb::to_hex(r.preview_rgb).c_str() : "", prefix.c_str(), r.valid ? (int)r.preview_rgb.r : 0,
-        prefix.c_str(), r.valid ? (int)r.preview_rgb.g : 0, prefix.c_str(), r.valid ? (int)r.preview_rgb.b : 0,
-        prefix.c_str(), lab.L, prefix.c_str(), lab.a, prefix.c_str(), lab.b,
-        prefix.c_str(), C, prefix.c_str(), M, prefix.c_str(), Y, prefix.c_str(), K,
-        prefix.c_str(), r.delta_e);
+        "\"type\":\"%s\",\"ids\":\"%s\",\"weights\":\"%s\","
+        "\"hex\":\"%s\",\"r\":%d,\"g\":%d,\"b\":%d,"
+        "\"L\":%.4f,\"a\":%.4f,\"b_lab\":%.4f,"
+        "\"C\":%.4f,\"M\":%.4f,\"Y\":%.4f,\"K\":%.4f,"
+        "\"delta_e\":%.4f",
+        type_str, ids.c_str(), weights.c_str(),
+        r.valid ? cmb::to_hex(r.preview_rgb).c_str() : "", r.valid ? (int)r.preview_rgb.r : 0,
+        r.valid ? (int)r.preview_rgb.g : 0, r.valid ? (int)r.preview_rgb.b : 0,
+        lab.L, lab.a, lab.b,
+        C, M, Y, K, r.delta_e);
     return buf;
 }
 
-std::string color_to_json(const std::string& prefix, cmb::RGB8 c) {
+std::string color_to_json(cmb::RGB8 c) {
     const cmb::Lab lab = cmb::rgb_to_lab(c);
     double C, M, Y, K;
     cmb::rgb_to_cmyk(c, C, M, Y, K);
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-        "\"%s_hex\":\"%s\",\"%s_R\":%d,\"%s_G\":%d,\"%s_B\":%d,"
-        "\"%s_L\":%.4f,\"%s_a\":%.4f,\"%s_b\":%.4f,"
-        "\"%s_C\":%.4f,\"%s_M\":%.4f,\"%s_Y\":%.4f,\"%s_K\":%.4f",
-        prefix.c_str(), cmb::to_hex(c).c_str(), prefix.c_str(), (int)c.r,
-        prefix.c_str(), (int)c.g, prefix.c_str(), (int)c.b,
-        prefix.c_str(), lab.L, prefix.c_str(), lab.a, prefix.c_str(), lab.b,
-        prefix.c_str(), C, prefix.c_str(), M, prefix.c_str(), Y, prefix.c_str(), K);
+        "\"hex\":\"%s\",\"r\":%d,\"g\":%d,\"b\":%d,"
+        "\"L\":%.4f,\"a\":%.4f,\"b_lab\":%.4f,"
+        "\"C\":%.4f,\"M\":%.4f,\"Y\":%.4f,\"K\":%.4f",
+        cmb::to_hex(c).c_str(), (int)c.r, (int)c.g, (int)c.b,
+        lab.L, lab.a, lab.b, C, M, Y, K);
     return buf;
 }
 
@@ -590,9 +590,9 @@ int run_serve_mode() {
                 const auto& r = results[i];
                 if (i) os << ",";
                 os << "{\"label\":\"" << json_escape(r.label) << "\","
-                   << "\"target\":{" << color_to_json("target", r.target_rgb) << "},"
-                   << "\"fs\":{" << recipe_to_json("fs", r.fs) << "},"
-                   << "\"prusa\":{" << recipe_to_json("prusa", r.prusa) << "}}";
+                   << "\"target\":{" << color_to_json(r.target_rgb) << "},"
+                   << "\"fs\":{" << recipe_to_json(r.fs) << "},"
+                   << "\"prusa\":{" << recipe_to_json(r.prusa) << "}}";
             }
             os << "],\"count\":" << results.size() << "}";
             std::cout << os.str() << "\n" << std::flush;
