@@ -1,0 +1,6 @@
+label,L,a,b
+mid_gray,50,0,0
+warm_gray,60,5,5
+cool_gray,60,-5,-5
+skin_tone,70,20,20
+forest,40,-30,20

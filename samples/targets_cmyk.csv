@@ -1,0 +1,6 @@
+label,C,M,Y,K
+pure_red,0,100,100,0
+pure_green,100,0,100,0
+pure_blue,100,100,0,0
+deep_red,0,100,80,20
+dark_green,80,0,100,40
