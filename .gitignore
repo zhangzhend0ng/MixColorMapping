@@ -1,10 +1,12 @@
 # Build artifacts
 build/
+dist/
 *.exe
 *.o
 *.obj
 *.a
 *.lib
+*.spec
 out/
 
 # Tool output (avoid committing run results)
@@ -14,6 +16,7 @@ results_*.csv
 # IDE / editor
 .vscode/
 .idea/
+.zcode/
 *.swp
 *~
 .cache/

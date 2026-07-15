@@ -15,8 +15,11 @@ SRC=(
     vendor/prusa_fdm_mixer.cpp
 )
 
-echo "[build] $CXX -std=c++17 -O2"
+# Static-link libgcc/libstdc++ so the binary runs on machines without MinGW
+# runtime DLLs on PATH (the C++ code has no other dynamic deps).
+echo "[build] $CXX -std=c++17 -O2 (static runtime)"
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+    -static-libgcc -static-libstdc++ \
     -Isrc -Ivendor \
     "${SRC[@]}" \
     -o build/color_match_batch
