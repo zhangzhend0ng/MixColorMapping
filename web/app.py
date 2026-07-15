@@ -252,8 +252,20 @@ def open_browser_async(url):
     threading.Thread(target=_open, daemon=True).start()
 
 
+def _port_in_use(port):
+    """Quick check whether a TCP port is already bound."""
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.close()
+        return False
+    except OSError:
+        return True
+
+
 def main():
-    port = DEFAULT_PORT
     cli = find_cli()
     if cli is None:
         print("[warn] build/color_match_batch not found — build it first (build.sh).", file=sys.stderr)
@@ -267,8 +279,23 @@ def main():
         except Exception as e:
             print("[warn] CLI worker failed to start: %s" % e, file=sys.stderr)
 
+    # Find a free port: try DEFAULT_PORT, then increment up to +20.
     socketserver.TCPServer.allow_reuse_address = True
-    httpd = socketserver.TCPServer(("127.0.0.1", port), Handler)
+    port = DEFAULT_PORT
+    httpd = None
+    for attempt in range(20):
+        if _port_in_use(port):
+            print("[info] port %d busy, trying %d ..." % (port, port + 1))
+            port += 1
+            continue
+        try:
+            httpd = socketserver.TCPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            port += 1
+    if httpd is None:
+        print("[error] could not find a free port in %d-%d" % (DEFAULT_PORT, port), file=sys.stderr)
+        sys.exit(1)
 
     def _cleanup():
         global _WORKER
@@ -279,7 +306,10 @@ def main():
 
     url = "http://localhost:%d" % port
     print("[color-mixer-batch] serving on %s" % url)
-    threading.Timer(0.3, lambda: open_browser_async(url)).start()
+    print("  (Ctrl+C to stop)")
+    # Flush so the user sees the URL before the browser opens.
+    sys.stdout.flush()
+    threading.Timer(0.5, lambda: open_browser_async(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
