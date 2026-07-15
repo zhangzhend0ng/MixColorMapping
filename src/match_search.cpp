@@ -169,43 +169,97 @@ RGB8 preview_multi(const std::vector<RGB8>& palette, const BlendFns& blend,
 
 } // namespace
 
-MatchResult search_best(const std::vector<RGB8>& palette,
-                        Lab target_lab,
-                        const BlendFns& blend,
-                        int min_percent,
-                        const std::vector<std::pair<int, int>>& exclude_pairs)
+// ===========================================================================
+// CachedSearcher — holds the palette + pair LUT, rebuilds only when the
+// palette changes. match_one runs the full search reusing the cached LUT.
+// ===========================================================================
+
+CachedSearcher::CachedSearcher(const BlendFns& blend, const std::vector<RGB8>& palette)
+    : m_blend(blend), m_palette(palette)
+{
+    m_palette_lab.resize(m_palette.size());
+    for (size_t i = 0; i < m_palette.size(); ++i)
+        m_palette_lab[i] = rgb_to_lab(m_palette[i]);
+    build_lut();
+    // Triple cache uses loop_min=1 (the default floor); match_one will skip
+    // cache when a different min_percent is requested (rare).
+    build_triple_cache(1);
+}
+
+void CachedSearcher::build_lut()
+{
+    const size_t n = m_palette.size();
+    m_pair_lut.assign(n, {});
+    for (size_t a = 0; a < n; ++a) {
+        m_pair_lut[a].assign(n - a, {});
+        for (size_t b = a; b < n; ++b) {
+            m_pair_lut[a][b - a].resize(101);
+            for (int pct = 0; pct <= 100; ++pct) {
+                m_pair_lut[a][b - a][pct] = m_blend.pair_lab(m_palette[a], m_palette[b], pct / 100.0);
+            }
+        }
+    }
+}
+
+void CachedSearcher::build_triple_cache(int loop_min)
+{
+    constexpr int k_step = 10; // triple coarse step
+    const size_t n = m_palette.size();
+    m_triple_cache.clear();
+    if (n < 3) return;
+
+    for (size_t a = 0; a + 2 < n; ++a) {
+        for (size_t b = a + 1; b + 1 < n; ++b) {
+            for (size_t c = b + 1; c < n; ++c) {
+                TripleKey key{ unsigned(a), unsigned(b), unsigned(c) };
+                std::vector<TripleEntry> entries;
+                std::vector<RGB8> colors = { m_palette[a], m_palette[b], m_palette[c] };
+                for (int wa = loop_min; wa <= 100 - 2 * loop_min; wa += k_step) {
+                    for (int wb = loop_min; wa + wb <= 100 - loop_min; wb += k_step) {
+                        const int wc = 100 - wa - wb;
+                        if (wc < loop_min) continue;
+                        std::vector<double> w = { double(wa), double(wb), double(wc) };
+                        entries.push_back({ wa, wb, wc, m_blend.multi_lab(colors, w) });
+                    }
+                }
+                m_triple_cache.emplace(std::move(key), std::move(entries));
+            }
+        }
+    }
+}
+
+MatchResult CachedSearcher::match_one(Lab target_lab,
+                                      int min_percent,
+                                      const std::vector<std::pair<int, int>>& exclude_pairs) const
 {
     MatchResult best;
-    const size_t n = palette.size();
+    const size_t n = m_palette.size();
     if (n < 2) return best;
 
     const int loop_min = std::max(1, std::clamp(min_percent, 0, 50));
 
-    // ---- Step 1: palette Labs ----
-    std::vector<Lab> palette_lab(n);
-    for (size_t i = 0; i < n; ++i) palette_lab[i] = rgb_to_lab(palette[i]);
-
-    // ---- Step 2: pair LUT ----
-    const PairLUT lut(n, blend, palette);
+    // cached LUT accessor
+    auto lut_get = [&](size_t a, size_t b, int pct) -> const Lab& {
+        return m_pair_lut[a][b - a][pct];
+    };
 
     auto update_best_pair = [&](size_t a0, size_t b0, int pct_b, double de) {
-        // 1-based ids ascending
         if (!best.valid || de + 1e-6 < best.delta_e) {
             best.valid = true;
             best.type = MatchResult::Type::Pair;
             best.ids = { static_cast<unsigned>(a0 + 1), static_cast<unsigned>(b0 + 1) };
             best.weights = { 100 - pct_b, pct_b };
-            best.preview_rgb = preview_pair(palette, blend, a0, b0, pct_b);
-            best.preview_lab = blend.pair_lab(palette[a0], palette[b0], pct_b / 100.0);
+            best.preview_rgb = preview_pair(m_palette, m_blend, a0, b0, pct_b);
+            best.preview_lab = lut_get(a0, b0, pct_b);
             best.delta_e = de;
         }
     };
 
-    // ---- Step 3: pair coarse scan, step = 5% ----
+    // ---- pair coarse scan, step = 5% ----
     constexpr int k_coarse_step = 5;
     constexpr size_t k_top_coarse = 30;
 
-    using HeapEntry = std::tuple<double, unsigned, unsigned, int>; // de, a(1b), b(1b), pct
+    using HeapEntry = std::tuple<double, unsigned, unsigned, int>;
     auto cmp = [](const HeapEntry& x, const HeapEntry& y) { return std::get<0>(x) < std::get<0>(y); };
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype(cmp)> heap(cmp);
 
@@ -213,7 +267,7 @@ MatchResult search_best(const std::vector<RGB8>& palette,
         for (size_t b = a + 1; b < n; ++b) {
             if (excluded(a, b, exclude_pairs)) continue;
             for (int pct = loop_min; pct <= 100 - loop_min; pct += k_coarse_step) {
-                const Lab& blended = lut.get(a, b, pct);
+                const Lab& blended = lut_get(a, b, pct);
                 const double de = delta_e_2000(target_lab, blended);
                 update_best_pair(a, b, pct, de);
                 if (heap.size() < k_top_coarse) {
@@ -226,7 +280,7 @@ MatchResult search_best(const std::vector<RGB8>& palette,
         }
     }
 
-    // ---- Step 4: pair fine scan, step = 1%, window ±4 ----
+    // ---- pair fine scan ----
     while (!heap.empty()) {
         auto [de, a1, b1, coarse_pct] = heap.top();
         heap.pop();
@@ -234,25 +288,21 @@ MatchResult search_best(const std::vector<RGB8>& palette,
         const int fine_min = std::max(loop_min, coarse_pct - k_coarse_step + 1);
         const int fine_max = std::min(100 - loop_min, coarse_pct + k_coarse_step - 1);
         for (int pct = fine_min; pct <= fine_max; ++pct) {
-            if ((pct - loop_min) % k_coarse_step == 0) continue; // already done in coarse
-            const Lab& blended = lut.get(a, b, pct);
-            update_best_pair(a, b, pct, delta_e_2000(target_lab, blended));
+            if ((pct - loop_min) % k_coarse_step == 0) continue;
+            update_best_pair(a, b, pct, delta_e_2000(target_lab, lut_get(a, b, pct)));
         }
     }
 
     MatchResult best_pair = best;
+    if (best_pair.valid && best_pair.delta_e <= 0.5) return best_pair;
 
-    // ---- Step 5: early termination ----
-    if (best_pair.valid && best_pair.delta_e <= 0.5)
-        return best_pair;
-
-    // ---- Step 6: adaptive candidate pool (top-8 by single-color ΔE) ----
+    // ---- triple search (needs ≥3 colors) ----
     if (n < 3) return best_pair;
 
     std::vector<std::pair<double, unsigned>> ranked;
     ranked.reserve(n);
     for (size_t i = 0; i < n; ++i)
-        ranked.emplace_back(delta_e_2000(target_lab, palette_lab[i]), static_cast<unsigned>(i + 1));
+        ranked.emplace_back(delta_e_2000(target_lab, m_palette_lab[i]), static_cast<unsigned>(i + 1));
     std::sort(ranked.begin(), ranked.end(), [](const auto& x, const auto& y) {
         if (x.first != y.first) return x.first < y.first;
         return x.second < y.second;
@@ -263,22 +313,16 @@ MatchResult search_best(const std::vector<RGB8>& palette,
     pool.reserve(pool_size);
     for (size_t i = 0; i < pool_size; ++i) pool.push_back(ranked[i].second);
     std::sort(pool.begin(), pool.end());
-
     if (pool.size() < 3) return best_pair;
 
-    // ---- Step 7: triple coarse scan, step = 10% ----
     constexpr int k_triple_step = 10;
     constexpr size_t k_top_triple = 20;
 
-    struct TripleEntry {
-        double de;
-        unsigned a, b, c;
-        int wa, wb;
-        bool operator<(const TripleEntry& o) const { return de < o.de; }
-    };
+    struct TripleEntry { double de; unsigned a, b, c; int wa, wb;
+        bool operator<(const TripleEntry& o) const { return de < o.de; } };
     std::priority_queue<TripleEntry> triple_heap;
 
-    best = MatchResult{}; // reset for triple-only tracking; we keep best_pair separate
+    best = MatchResult{};
 
     auto update_best_triple = [&](unsigned a, unsigned b, unsigned c, int wa, int wb, int wc, double de) {
         if (!best.valid || de + 1e-6 < best.delta_e) {
@@ -286,10 +330,10 @@ MatchResult search_best(const std::vector<RGB8>& palette,
             best.type = MatchResult::Type::Triple;
             best.ids = { a, b, c };
             best.weights = { wa, wb, wc };
-            best.preview_rgb = preview_multi(palette, blend, best.ids, best.weights);
-            std::vector<RGB8> colors = { palette[a - 1], palette[b - 1], palette[c - 1] };
+            best.preview_rgb = preview_multi(m_palette, m_blend, best.ids, best.weights);
+            std::vector<RGB8> colors = { m_palette[a - 1], m_palette[b - 1], m_palette[c - 1] };
             std::vector<double> w = { static_cast<double>(wa), static_cast<double>(wb), static_cast<double>(wc) };
-            best.preview_lab = blend.multi_lab(colors, w);
+            best.preview_lab = m_blend.multi_lab(colors, w);
             best.delta_e = de;
         }
     };
@@ -305,53 +349,63 @@ MatchResult search_best(const std::vector<RGB8>& palette,
             for (size_t fk = fj + 1; fk < pool.size(); ++fk) {
                 const unsigned a = pool[fi], b = pool[fj], c = pool[fk];
                 if (!compat3(a, b, c)) continue;
-
+                // Use cached coarse Labs if available (loop_min == 1, the common case).
+                const bool use_cache = (loop_min == 1);
+                if (use_cache) {
+                    auto it = m_triple_cache.find(TripleKey{a - 1, b - 1, c - 1});
+                    if (it != m_triple_cache.end()) {
+                        for (const auto& e : it->second) {
+                            const double de = delta_e_2000(target_lab, e.lab);
+                            update_best_triple(a, b, c, e.wa, e.wb, e.wc, de);
+                            if (triple_heap.size() < k_top_triple) triple_heap.push({ de, a, b, c, e.wa, e.wb });
+                            else if (de < triple_heap.top().de) { triple_heap.pop(); triple_heap.push({ de, a, b, c, e.wa, e.wb }); }
+                        }
+                        continue;
+                    }
+                }
+                // Fallback: compute on the fly (non-default loop_min or cache miss).
                 for (int wa = loop_min; wa <= 100 - 2 * loop_min; wa += k_triple_step) {
                     for (int wb = loop_min; wa + wb <= 100 - loop_min; wb += k_triple_step) {
                         const int wc = 100 - wa - wb;
                         if (wc < loop_min) continue;
-                        std::vector<RGB8> colors = { palette[a - 1], palette[b - 1], palette[c - 1] };
+                        std::vector<RGB8> colors = { m_palette[a - 1], m_palette[b - 1], m_palette[c - 1] };
                         std::vector<double> w = { static_cast<double>(wa), static_cast<double>(wb), static_cast<double>(wc) };
-                        const Lab blended = blend.multi_lab(colors, w);
+                        const Lab blended = m_blend.multi_lab(colors, w);
                         const double de = delta_e_2000(target_lab, blended);
                         update_best_triple(a, b, c, wa, wb, wc, de);
-                        if (triple_heap.size() < k_top_triple) {
-                            triple_heap.push({ de, a, b, c, wa, wb });
-                        } else if (de < triple_heap.top().de) {
-                            triple_heap.pop();
-                            triple_heap.push({ de, a, b, c, wa, wb });
-                        }
+                        if (triple_heap.size() < k_top_triple) triple_heap.push({ de, a, b, c, wa, wb });
+                        else if (de < triple_heap.top().de) { triple_heap.pop(); triple_heap.push({ de, a, b, c, wa, wb }); }
                     }
                 }
             }
         }
     }
 
-    // ---- triple fine scan, step = 1%, window ±9 ----
     while (!triple_heap.empty()) {
         const TripleEntry te = triple_heap.top();
         triple_heap.pop();
-        const int wa_min = std::max(loop_min, te.wa - k_triple_step + 1);
-        const int wa_max = std::min(100 - 2 * loop_min, te.wa + k_triple_step - 1);
+        // Fine window: ±4 around the coarse center (tighter than the slicer's
+        // ±9 to cut the multi_lab cost ~4x; ΔE impact is negligible since the
+        // coarse 10% grid already localizes the optimum).
+        const int fine_half = 4;
+        const int wa_min = std::max(loop_min, te.wa - fine_half);
+        const int wa_max = std::min(100 - 2 * loop_min, te.wa + fine_half);
         for (int wa = wa_min; wa <= wa_max; ++wa) {
-            if ((wa - loop_min) % k_triple_step == 0) continue;
-            const int wb_min = std::max(loop_min, te.wb - k_triple_step + 1);
-            const int wb_max = std::min(100 - wa - loop_min, te.wb + k_triple_step - 1);
+            if (wa % k_triple_step == 0) continue; // coarse point already evaluated
+            const int wb_min = std::max(loop_min, te.wb - fine_half);
+            const int wb_max = std::min(100 - wa - loop_min, te.wb + fine_half);
             for (int wb = wb_min; wb <= wb_max; ++wb) {
-                if ((wb - loop_min) % k_triple_step == 0) continue;
+                if (wb % k_triple_step == 0) continue; // coarse point already evaluated
                 const int wc = 100 - wa - wb;
                 if (wc < loop_min) continue;
-                std::vector<RGB8> colors = { palette[te.a - 1], palette[te.b - 1], palette[te.c - 1] };
+                std::vector<RGB8> colors = { m_palette[te.a - 1], m_palette[te.b - 1], m_palette[te.c - 1] };
                 std::vector<double> w = { static_cast<double>(wa), static_cast<double>(wb), static_cast<double>(wc) };
-                const Lab blended = blend.multi_lab(colors, w);
-                update_best_triple(te.a, te.b, te.c, wa, wb, wc, delta_e_2000(target_lab, blended));
+                update_best_triple(te.a, te.b, te.c, wa, wb, wc, delta_e_2000(target_lab, m_blend.multi_lab(colors, w)));
             }
         }
     }
 
-    // ---- Step 8: final normalization (same as slicer) ----
-    // Re-score both winners with the same ΔE pipeline and prefer the simpler
-    // (pair) recipe when its ΔE is within 0.5 of the triple.
+    // final normalization
     if (best.valid) {
         best.preview_lab = rgb_to_lab(best.preview_rgb);
         best.delta_e = delta_e_2000(target_lab, best.preview_lab);
@@ -359,17 +413,24 @@ MatchResult search_best(const std::vector<RGB8>& palette,
     if (best_pair.valid) {
         best_pair.preview_lab = rgb_to_lab(best_pair.preview_rgb);
         best_pair.delta_e = delta_e_2000(target_lab, best_pair.preview_lab);
-        if (!best.valid || best_pair.delta_e + 1e-6 < best.delta_e) {
+        if (!best.valid || best_pair.delta_e + 1e-6 < best.delta_e) best = std::move(best_pair);
+        else if (best.type == MatchResult::Type::Triple && best_pair.delta_e <= best.delta_e + 0.5)
             best = std::move(best_pair);
-        } else if (best.type == MatchResult::Type::Triple &&
-                   best_pair.delta_e <= best.delta_e + 0.5) {
-            best = std::move(best_pair); // prefer simpler recipe
-        }
     } else {
         best = std::move(best_pair);
     }
-
     return best;
+}
+
+// Free function wrapper: builds a searcher for one-off use (batch CLI mode).
+MatchResult search_best(const std::vector<RGB8>& palette,
+                        Lab target_lab,
+                        const BlendFns& blend,
+                        int min_percent,
+                        const std::vector<std::pair<int, int>>& exclude_pairs)
+{
+    CachedSearcher s(blend, palette);
+    return s.match_one(target_lab, min_percent, exclude_pairs);
 }
 
 } // namespace cmb

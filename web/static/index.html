@@ -166,6 +166,7 @@
 <script>
 let debounceTimer = null;
 let lastData = null;
+let requestSeq = 0;
 
 // ---- defaults loading ----
 async function loadDefaults() {
@@ -341,7 +342,7 @@ function debouncedRecompute() {
   // also refresh all swatches on edit
   document.querySelectorAll('#paletteTable tbody tr').forEach(updateSwatch);
   document.querySelectorAll('#targetTable tbody tr').forEach(updateSwatch);
-  debounceTimer = setTimeout(recompute, 400);
+  debounceTimer = setTimeout(recompute, 150);
 }
 
 async function recompute() {
@@ -350,6 +351,7 @@ async function recompute() {
   if (palette.length < 2) { setStatus('调色板至少需要 2 个颜色', true); return; }
   if (targets.length === 0) { setStatus('没有目标色行', true); return; }
 
+  const mySeq = ++requestSeq;
   setStatus('<span class="spinner"></span> 计算中...');
   try {
     const body = {
@@ -364,10 +366,11 @@ async function recompute() {
       body: JSON.stringify(body)
     });
     const data = await r.json();
+    if (mySeq !== requestSeq) return;  // superseded by a newer request
     if (data.error) { setStatus('错误: ' + data.error, true); return; }
     lastData = data;
     renderResults(data.rows);
-    setStatus(`完成 · ${data.count} 个目标色 · (CLI stderr: ${(data.stderr||'').trim().split('\n').slice(-2).join(' ').trim() || '无'})`);
+    setStatus(`完成 · ${data.count} 个目标色`);
   } catch (e) {
     setStatus('请求失败: ' + e.message, true);
   }
@@ -431,30 +434,38 @@ function renderResults(rows) {
 }
 
 // ---- export ----
-async function exportCsv() {
-  const palette = collectPalette();
-  const targets = collectTargets();
-  const body = {
-    palette, targets,
-    format: document.getElementById('formatSel').value,
-    rgb_scale: document.getElementById('rgbScaleSel').value,
-    min_percent: parseInt(document.getElementById('minPctInput').value) || 0,
-    exclude: document.getElementById('excludeInput').value.trim(),
-  };
-  try {
-    const r = await fetch('/api/export', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)
+// Build the CSV client-side from lastData — same 42-column layout as the CLI,
+// so the exported file is byte-compatible with batch mode.
+function exportCsv() {
+  if (!lastData || !lastData.rows || lastData.rows.length === 0) {
+    setStatus('没有可导出的结果，先计算一次', true); return;
+  }
+  const COLS = (p) => [`${p}_type`,`${p}_ids`,`${p}_weights`,`${p}_hex`,`${p}_R`,`${p}_G`,`${p}_B`,`${p}_L`,`${p}_a`,`${p}_b`,`${p}_C`,`${p}_M`,`${p}_Y`,`${p}_K`,`${p}_delta_e`];
+  let csv = 'label,' +
+    ['target_hex','target_R','target_G','target_B','target_L','target_a','target_b','target_C','target_M','target_Y','target_K'].join(',') + ',' +
+    COLS('fs').join(',') + ',' + COLS('prusa').join(',') + '\n';
+  lastData.rows.forEach(r => {
+    const t = r.target, fs = r.fs, pr = r.prusa;
+    const row = [r.label];
+    row.push(t.hex, t.r, t.g, t.b, t.L.toFixed(4), t.a.toFixed(4), t.b_lab.toFixed(4), t.C.toFixed(4), t.M.toFixed(4), t.Y.toFixed(4), t.K.toFixed(4));
+    [fs, pr].forEach(b => {
+      row.push(b.type, b.ids, b.weights, b.hex, b.r, b.g, b.b,
+        b.L.toFixed(4), b.a.toFixed(4), b.b_lab.toFixed(4),
+        b.C.toFixed(4), b.M.toFixed(4), b.Y.toFixed(4), b.K.toFixed(4),
+        b.delta_e.toFixed(4));
     });
-    if (!r.ok) { const d = await r.json(); setStatus('导出失败: '+(d.error||r.status), true); return; }
-    const blob = await r.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'results.csv';
-    a.click();
-    URL.revokeObjectURL(a.href);
-    setStatus('已导出 results.csv');
-  } catch(e) { setStatus('导出失败: '+e.message, true); }
+    csv += row.map(v => {
+      const s = String(v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+    }).join(',') + '\n';
+  });
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'results.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  setStatus('已导出 results.csv (' + lastData.rows.length + ' 行)');
 }
 
 // ---- utils ----
