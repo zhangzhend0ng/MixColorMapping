@@ -22,3 +22,7 @@ compile_commands.json
 # OS
 Thumbs.db
 .DS_Store
+
+# Python (web UI)
+__pycache__/
+*.pyc

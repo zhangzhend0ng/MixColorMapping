@@ -12,6 +12,17 @@ The two algorithm files are vendored **unmodified** from the Snapmaker Orca
 slicer — see [`vendor/PROVENANCE.md`](vendor/PROVENANCE.md) for the source
 commit and file SHAs.
 
+## Two ways to use it
+
+**① Web UI (recommended)** — edit palette/targets in the browser, see color
+swatches side by side, auto-recompute on every edit, export CSV when done:
+```
+./web/start.sh        # builds CLI if needed, opens http://localhost:8008
+```
+Requires Python 3. No third-party packages (stdlib `http.server` only).
+
+**② CLI** — batch-process CSV files directly (see [Usage](#usage) below).
+
 ## What it does
 
 For every target color in your spreadsheet:
@@ -160,3 +171,19 @@ color-mixer-batch/
     ├── targets_lab.csv
     └── targets_cmyk.csv
 ```
+
+## Web UI (`web/`)
+
+```
+web/
+├── app.py                stdlib-only HTTP server; spawns CLI, returns JSON
+├── start.sh / start.bat  build-if-needed + launch
+└── static/
+    └── index.html        single-page UI (no framework, vanilla JS)
+```
+
+The server writes temp CSVs, invokes `build/color_match_batch`, parses the
+42-column result back into JSON, and the page renders color swatches + recipe
+tables. Every edit triggers a debounced recompute (400ms) — the CLI runs in
+<100ms for typical palettes, so it feels instant. The page auto-loads demo
+palette/targets on first visit; edit freely or paste your own.

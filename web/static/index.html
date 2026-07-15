@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FS vs Prusa 混色对比</title>
+<style>
+  :root {
+    --bg: #1a1a2e; --panel: #16213e; --panel2: #0f3460;
+    --text: #e8e8e8; --muted: #8a8a9a; --accent: #e94560;
+    --border: #2a2a4a; --ok: #4ecca3; --warn: #f0a500;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  header {
+    background: var(--panel); padding: 12px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .container { max-width: 1500px; margin: 0 auto; padding: 16px 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+  }
+  .panel h2 {
+    margin: 0 0 10px; font-size: 14px; color: var(--accent);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel h2 .actions { display: flex; gap: 6px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 5px 6px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  input, select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 6px; border-radius: 4px; font-size: 13px; width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .swatch {
+    display: inline-block; width: 22px; height: 22px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.2); vertical-align: middle;
+  }
+  .swatch-cell { display: flex; align-items: center; gap: 6px; }
+  .btn {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); }
+  .btn-sm { padding: 2px 6px; font-size: 11px; }
+  .opts-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .opts-row label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }
+  .opts-row input, .opts-row select { width: auto; }
+  /* result table */
+  .res-table { font-size: 12px; }
+  .res-table th, .res-table td { white-space: nowrap; }
+  .res-table td.num { font-family: "Consolas", monospace; color: var(--muted); }
+  .res-table .col-label { font-weight: 600; color: var(--text); }
+  .delta-good { color: var(--ok); }
+  .delta-warn { color: var(--warn); }
+  .delta-bad  { color: var(--accent); }
+  .status-bar {
+    margin-top: 10px; padding: 8px 12px; background: var(--panel2);
+    border-radius: 6px; font-size: 12px; color: var(--muted); min-height: 20px;
+  }
+  .status-bar.err { color: var(--accent); }
+  .status-bar .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .swatch-compare { display: inline-flex; gap: 0; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.2); }
+  .swatch-compare div { width: 28px; height: 28px; }
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+  .legend span { display: flex; align-items: center; gap: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FS vs Prusa 混色对比</h1>
+  <span class="sub">反向匹配 · 同一 ΔE2000 标尺 · 双算法并排</span>
+  <span style="margin-left:auto" id="cliStatus" class="sub"></span>
+</header>
+
+<div class="container">
+  <div class="grid">
+    <!-- PALETTE -->
+    <div class="panel">
+      <h2>调色板 Palette
+        <span class="actions">
+          <button class="btn btn-sm" onclick="addPaletteRow()">+ 行</button>
+        </span>
+      </h2>
+      <table id="paletteTable">
+        <thead><tr><th style="width:24px"></th><th>Hex #RRGGBB</th><th>标签</th><th style="width:24px"></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- TARGETS -->
+    <div class="panel">
+      <h2>目标色 Targets
+        <span class="actions">
+          <button class="btn btn-sm" onclick="addTargetRow()">+ 行</button>
+        </span>
+      </h2>
+      <div class="opts-row">
+        <label>格式
+          <select id="formatSel" onchange="rebuildTargetHeader(); debouncedRecompute()">
+            <option value="hex">Hex #RRGGBB</option>
+            <option value="rgb">RGB</option>
+            <option value="lab">CIELab</option>
+            <option value="cmyk">CMYK</option>
+          </select>
+        </label>
+        <label>RGB 标尺
+          <select id="rgbScaleSel" onchange="debouncedRecompute()">
+            <option value="auto">auto</option>
+            <option value="255">0-255</option>
+            <option value="1">0-1</option>
+          </select>
+        </label>
+        <label>最小成分 %
+          <input type="number" id="minPctInput" value="0" min="0" max="50" style="width:54px" onchange="debouncedRecompute()">
+        </label>
+        <label>排除对 (如 1-2,3-4)
+          <input type="text" id="excludeInput" value="" placeholder="1-2,3-4" style="width:120px" onchange="debouncedRecompute()">
+        </label>
+      </div>
+      <table id="targetTable">
+        <thead><tr id="targetHeader"></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="legend" id="targetLegend"></div>
+    </div>
+  </div>
+
+  <!-- ACTIONS -->
+  <div class="panel" style="margin-top:16px; display:flex; gap:10px; align-items:center;">
+    <button class="btn btn-primary" onclick="recompute()">立即重算</button>
+    <button class="btn" onclick="exportCsv()">导出 results.csv</button>
+    <label class="sub" style="display:flex;align-items:center;gap:4px;color:var(--muted);font-size:12px;">
+      <input type="checkbox" id="autoRecompute" checked style="width:auto"> 编辑后自动重算
+    </label>
+    <span id="status" class="status-bar" style="flex:1; margin:0;">就绪</span>
+  </div>
+
+  <!-- RESULTS -->
+  <div class="panel" style="margin-top:16px;">
+    <h2>对比结果 <span class="actions"><span class="sub" id="resultCount" style="color:var(--muted)"></span></span></h2>
+    <div style="overflow-x:auto;">
+      <table class="res-table" id="resultTable">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let debounceTimer = null;
+let lastData = null;
+
+// ---- defaults loading ----
+async function loadDefaults() {
+  try {
+    const r = await fetch('/api/defaults');
+    const d = await r.json();
+    if (d.palette) { setPaletteRows(d.palette); }
+    if (d.targets) { setTargetRows(d.targets); }
+    if (d.format) { document.getElementById('formatSel').value = d.format; }
+    if (d.rgb_scale) { document.getElementById('rgbScaleSel').value = d.rgb_scale; }
+    document.getElementById('cliStatus').textContent =
+      d.cli_found ? '● CLI ready' : '✗ CLI 未构建(先运行 build.sh)';
+    document.getElementById('cliStatus').style.color = d.cli_found ? 'var(--ok)' : 'var(--accent)';
+    rebuildTargetHeader();
+    recompute();
+  } catch (e) {
+    setStatus('加载默认数据失败: ' + e.message, true);
+  }
+}
+
+// ---- palette editing ----
+function setPaletteRows(rows) {
+  const tb = document.querySelector('#paletteTable tbody');
+  tb.innerHTML = '';
+  rows.forEach(r => addPaletteRow(r));
+}
+function addPaletteRow(data) {
+  const tb = document.querySelector('#paletteTable tbody');
+  const tr = document.createElement('tr');
+  // data: [hex,label] or [label,hex]
+  let hex = '', label = '';
+  if (Array.isArray(data)) {
+    if (data[0] && data[0].startsWith('#')) { hex = data[0]; label = data[1] || ''; }
+    else if (data[1] && data[1].startsWith('#')) { label = data[0] || ''; hex = data[1]; }
+    else { hex = data[0] || ''; }
+  }
+  tr.innerHTML = `
+    <td><span class="swatch" id=""></span></td>
+    <td><input type="text" value="${escapeAttr(hex)}" placeholder="#FF0000" oninput="onPaletteEdit(this)"></td>
+    <td><input type="text" value="${escapeAttr(label)}" placeholder="标签(可选)" oninput="debouncedRecompute()"></td>
+    <td><button class="btn btn-sm" onclick="delRow(this)">✕</button></td>`;
+  tb.appendChild(tr);
+  updateSwatch(tr);
+}
+
+// ---- target editing ----
+function setTargetRows(rows) {
+  const tb = document.querySelector('#targetTable tbody');
+  tb.innerHTML = '';
+  rows.forEach(r => addTargetRow(r));
+}
+function nComp(fmt) {
+  return fmt === 'hex' ? 1 : (fmt === 'cmyk' ? 4 : 3);
+}
+function rebuildTargetHeader() {
+  const fmt = document.getElementById('formatSel').value;
+  const nc = nComp(fmt);
+  const compNames = {
+    hex: ['Hex'], rgb: ['R','G','B'], lab: ['L','a','b'], cmyk: ['C','M','Y','K']
+  }[fmt];
+  let html = '<th style="width:24px"></th><th>标签</th>';
+  compNames.forEach(c => html += `<th>${c}</th>`);
+  html += '<th style="width:24px"></th>';
+  document.getElementById('targetHeader').innerHTML = html;
+  // legend
+  const legend = document.getElementById('targetLegend');
+  legend.innerHTML = '';
+  const placeholders = {
+    hex: '#FF8800', rgb: '255,136,0', lab: '50,0,0', cmyk: '0,100,100,0'
+  }[fmt];
+  legend.innerHTML = `<span>示例: <code>${placeholders}</code></span>`;
+}
+function addTargetRow(data) {
+  const tb = document.querySelector('#targetTable tbody');
+  const fmt = document.getElementById('formatSel').value;
+  const tr = document.createElement('tr');
+  let label = '', comps = [];
+  if (Array.isArray(data)) {
+    label = data[0] || '';
+    comps = data.slice(1);
+  }
+  const nc = nComp(fmt);
+  let swatchHtml = '<td><span class="swatch"></span></td>';
+  let labelHtml = `<td><input type="text" value="${escapeAttr(label)}" placeholder="标签" oninput="debouncedRecompute()"></td>`;
+  let compHtml = '';
+  for (let i = 0; i < nc; i++) {
+    const ph = fmt === 'hex' ? '#FF8800' : '0';
+    compHtml += `<td><input type="text" value="${escapeAttr(comps[i]||'')}" placeholder="${ph}" oninput="onTargetEdit(this)"></td>`;
+  }
+  tr.innerHTML = swatchHtml + labelHtml + compHtml + '<td><button class="btn btn-sm" onclick="delRow(this)">✕</button></td>';
+  tb.appendChild(tr);
+}
+
+function onTargetEdit(input) {
+  updateSwatch(input.closest('tr'));
+  debouncedRecompute();
+}
+function onPaletteEdit(input) {
+  updateSwatch(input.closest('tr'));
+  debouncedRecompute();
+}
+
+// parse a target row's components into a swatch color (best effort, client-side preview only)
+function updateSwatch(tr) {
+  // For palette: 2nd cell is hex. For target: depends on format.
+  const inputs = tr.querySelectorAll('input');
+  // find which table
+  const isPalette = tr.closest('#paletteTable');
+  const sw = tr.querySelector('.swatch');
+  if (!sw) return;
+  if (isPalette) {
+    // hex in inputs[0]
+    const hex = (inputs[0].value || '').trim();
+    sw.style.background = /^#?[0-9a-fA-F]{6}$/.test(hex) ? normalizeHex(hex) : 'transparent';
+  } else {
+    // target: label=inputs[0], then components
+    const fmt = document.getElementById('formatSel').value;
+    const vals = Array.from(inputs).slice(1).map(i => (i.value||'').trim());
+    let hex = '';
+    try {
+      if (fmt === 'hex') {
+        if (/^#?[0-9a-fA-F]{6}$/.test(vals[0])) hex = normalizeHex(vals[0]);
+      } else {
+        const nums = vals.map(Number);
+        if (nums.every(n => !isNaN(n))) {
+          if (fmt === 'rgb') {
+            hex = rgbToHex(clamp255(nums[0]), clamp255(nums[1]), clamp255(nums[2]));
+          } else if (fmt === 'cmyk') {
+            const [C,M,Y,K] = nums.map(n => n > 1.5 ? n/100 : n);
+            const r = 255*(1-C)*(1-K), g = 255*(1-M)*(1-K), b = 255*(1-Y)*(1-K);
+            hex = rgbToHex(r,g,b);
+          } else if (fmt === 'lab') {
+            // can't convert Lab→RGB in JS easily without a lib; leave blank
+          }
+        }
+      }
+    } catch(e) {}
+    sw.style.background = hex || 'transparent';
+  }
+}
+
+// ---- collect form data ----
+function collectPalette() {
+  const rows = [];
+  document.querySelectorAll('#paletteTable tbody tr').forEach(tr => {
+    const inputs = tr.querySelectorAll('input');
+    const hex = (inputs[0].value || '').trim();
+    const label = (inputs[1].value || '').trim();
+    if (hex) rows.push(label ? [hex, label] : [hex]);
+  });
+  return rows;
+}
+function collectTargets() {
+  const rows = [];
+  document.querySelectorAll('#targetTable tbody tr').forEach(tr => {
+    const inputs = tr.querySelectorAll('input');
+    const label = (inputs[0].value || '').trim();
+    const comps = Array.from(inputs).slice(1).map(i => (i.value||'').trim());
+    if (label || comps.some(c => c)) rows.push([label, ...comps]);
+  });
+  return rows;
+}
+
+// ---- recompute ----
+function setStatus(msg, isErr) {
+  const el = document.getElementById('status');
+  el.className = 'status-bar' + (isErr ? ' err' : '');
+  el.innerHTML = msg;
+}
+function debouncedRecompute() {
+  if (!document.getElementById('autoRecompute').checked) return;
+  clearTimeout(debounceTimer);
+  // also refresh all swatches on edit
+  document.querySelectorAll('#paletteTable tbody tr').forEach(updateSwatch);
+  document.querySelectorAll('#targetTable tbody tr').forEach(updateSwatch);
+  debounceTimer = setTimeout(recompute, 400);
+}
+
+async function recompute() {
+  const palette = collectPalette();
+  const targets = collectTargets();
+  if (palette.length < 2) { setStatus('调色板至少需要 2 个颜色', true); return; }
+  if (targets.length === 0) { setStatus('没有目标色行', true); return; }
+
+  setStatus('<span class="spinner"></span> 计算中...');
+  try {
+    const body = {
+      palette, targets,
+      format: document.getElementById('formatSel').value,
+      rgb_scale: document.getElementById('rgbScaleSel').value,
+      min_percent: parseInt(document.getElementById('minPctInput').value) || 0,
+      exclude: document.getElementById('excludeInput').value.trim(),
+    };
+    const r = await fetch('/api/match', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (data.error) { setStatus('错误: ' + data.error, true); return; }
+    lastData = data;
+    renderResults(data.rows);
+    setStatus(`完成 · ${data.count} 个目标色 · (CLI stderr: ${(data.stderr||'').trim().split('\n').slice(-2).join(' ').trim() || '无'})`);
+  } catch (e) {
+    setStatus('请求失败: ' + e.message, true);
+  }
+}
+
+// ---- render results ----
+function renderResults(rows) {
+  const thead = document.querySelector('#resultTable thead');
+  const tbody = document.querySelector('#resultTable tbody');
+  document.getElementById('resultCount').textContent = rows.length + ' 行';
+
+  thead.innerHTML = `<tr>
+    <th rowspan="2">标签</th>
+    <th colspan="4">目标色</th>
+    <th colspan="6">FS (多项式)</th>
+    <th colspan="6">Prusa (Yule-Nielsen)</th>
+  </tr><tr>
+    <th>色块</th><th>Hex</th><th>Lab</th><th>ΔE标</th>
+    <th>色块</th><th>配方</th><th>Hex</th><th>Lab</th><th>ΔE</th><th>ΔE差</th>
+    <th>色块</th><th>配方</th><th>Hex</th><th>Lab</th><th>ΔE</th><th>ΔE差</th>
+  </tr>`;
+
+  tbody.innerHTML = '';
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    const t = row.target, fs = row.fs, pr = row.prusa;
+    const tHex = '#' + hexStr(t.r,t.g,t.b);
+    const fsHex = fs.hex || '#000';
+    const prHex = pr.hex || '#000';
+    const fsDe = fs.delta_e, prDe = pr.delta_e;
+    const fsDeltaCls = fsDe < 1 ? 'delta-good' : (fsDe < 5 ? 'delta-warn' : 'delta-bad');
+    const prDeltaCls = prDe < 1 ? 'delta-good' : (prDe < 5 ? 'delta-warn' : 'delta-bad');
+
+    // diff vs target
+    const fsDiff = fsDe, prDiff = prDe;
+    const winner = fsDe <= prDe ? 'FS' : 'Prusa';
+
+    tr.innerHTML = `
+      <td class="col-label">${escapeHtml(row.label)}</td>
+      <td><div class="swatch-compare"><div style="background:${tHex}"></div><div style="background:${fsHex}"></div><div style="background:${prHex}"></div></div></td>
+      <td class="num">${tHex}<br><span style="font-size:10px;color:var(--muted)">${t.r},${t.g},${t.b}</span></td>
+      <td class="num">${t.L.toFixed(1)},${t.a.toFixed(1)},${t.b_lab.toFixed(1)}</td>
+      <td class="num" style="color:var(--muted)">—</td>
+
+      <td><div class="swatch-compare"><div style="background:${tHex}"></div><div style="background:${fsHex}"></div></div></td>
+      <td class="num">${fs.type}<br><span style="font-size:10px">${fs.ids}<br>${fs.weights}</span></td>
+      <td class="num">${fsHex}</td>
+      <td class="num">${fs.L.toFixed(1)},${fs.a.toFixed(1)},${fs.b_lab.toFixed(1)}</td>
+      <td class="num ${fsDeltaCls}">${fsDe.toFixed(2)}</td>
+      <td class="num" style="color:${winner==='FS'?'var(--ok)':'var(--muted)'}">${winner==='FS'?'★':''}</td>
+
+      <td><div class="swatch-compare"><div style="background:${tHex}"></div><div style="background:${prHex}"></div></div></td>
+      <td class="num">${pr.type}<br><span style="font-size:10px">${pr.ids}<br>${pr.weights}</span></td>
+      <td class="num">${prHex}</td>
+      <td class="num">${pr.L.toFixed(1)},${pr.a.toFixed(1)},${pr.b_lab.toFixed(1)}</td>
+      <td class="num ${prDeltaCls}">${prDe.toFixed(2)}</td>
+      <td class="num" style="color:${winner==='Prusa'?'var(--ok)':'var(--muted)'}">${winner==='Prusa'?'★':''}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// ---- export ----
+async function exportCsv() {
+  const palette = collectPalette();
+  const targets = collectTargets();
+  const body = {
+    palette, targets,
+    format: document.getElementById('formatSel').value,
+    rgb_scale: document.getElementById('rgbScaleSel').value,
+    min_percent: parseInt(document.getElementById('minPctInput').value) || 0,
+    exclude: document.getElementById('excludeInput').value.trim(),
+  };
+  try {
+    const r = await fetch('/api/export', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const d = await r.json(); setStatus('导出失败: '+(d.error||r.status), true); return; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'results.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus('已导出 results.csv');
+  } catch(e) { setStatus('导出失败: '+e.message, true); }
+}
+
+// ---- utils ----
+function delRow(btn) { btn.closest('tr').remove(); debouncedRecompute(); }
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function escapeAttr(s){return String(s).replace(/"/g,'&quot;');}
+function clamp255(v){return Math.max(0,Math.min(255,v));}
+function normalizeHex(h){return h.startsWith('#')?h:'#'+h;}
+function hexStr(r,g,b){return [r,g,b].map(v=>clamp255(Math.round(v)).toString(16).padStart(2,'0')).join('');}
+function rgbToHex(r,g,b){return '#'+hexStr(r,g,b);}
+
+// init
+rebuildTargetHeader();
+loadDefaults();
+</script>
+</body>
+</html>
