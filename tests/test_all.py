@@ -190,44 +190,106 @@ finally:
     srv.terminate(); srv.wait(timeout=5)
 
 # =========================================================================
-print("\n=== T5: xlsx upload/download (128 colors) ===")
+print("\n=== T5: xlsx upload/download ===")
 # =========================================================================
-# restart server for xlsx test
-srv = subprocess.Popen(["python", "-u", "web/app.py"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(3)
+# Build a sample .xlsx in-memory (Lab targets on "Sheet1") so the test is
+# self-contained and does not depend on an external user file. 24 colors is
+# enough to exercise the batch path while staying fast.
 try:
-    xlsx_path = r"C:\Users\snapmaker\Downloads\测试.xlsx"
-    if os.path.isfile(xlsx_path):
-        with open(xlsx_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        req = json.dumps({"xlsx":b64,"palette":PAL8,"min_percent":0,"exclude":""}).encode()
+    import openpyxl
+    N_ROWS = 24
+    _wb = openpyxl.Workbook()
+    _ws = _wb.active
+    _ws.title = "Sheet1"
+    _ws.append(["序号", "L*", "a*", "b*"])
+    # deterministic spread across the Lab gamut
+    _ls = [30, 50, 70, 90]
+    _as = [-40, 0, 40]
+    _bs = [-40, 0, 40]
+    _i = 0
+    for _L in _ls:
+        for _a in _as:
+            for _b in _bs:
+                if _i >= N_ROWS:
+                    break
+                _i += 1
+                _ws.append([_i, _L, _a, _b])
+    _buf = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    _wb.save(_buf.name)
+    _buf.close()
+    _xlsx_bytes = open(_buf.name, "rb").read()
+    os.unlink(_buf.name)
+    HAS_OPENPYXL_TEST = True
+except ImportError:
+    HAS_OPENPYXL_TEST = False
+
+if not HAS_OPENPYXL_TEST:
+    check("T5 openpyxl available", False, "openpyxl not installed — install with: pip install openpyxl")
+else:
+    # restart server for xlsx test
+    srv = subprocess.Popen(["python", "-u", "web/app.py"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    # CMYW palette — the xlsx output maps recipes into fixed C/M/Y/W columns
+    # by matching palette hex to standard subtractive primaries.
+    PAL_CMYW = [["#00FFFF","Cyan"],["#FF00FF","Magenta"],["#FFFF00","Yellow"],["#FFFFFF","White"]]
+    try:
+        b64 = base64.b64encode(_xlsx_bytes).decode()
+        req = json.dumps({"xlsx":b64,"palette":PAL_CMYW,"min_percent":0,"exclude":""}).encode()
         t0 = time.perf_counter()
         st, body = api_post("/api/xlsx/run", req)
         elapsed = time.perf_counter() - t0
-        check("T5 xlsx upload (HTTP)", st == 200 and len(body) > 10000, f"st={st} size={len(body)}")
+        check("T5 xlsx upload (HTTP)", st == 200 and len(body) > 5000, f"st={st} size={len(body)}")
         check("T5 xlsx latency (< 5s)", elapsed < 5.0, f"{elapsed:.1f}s")
 
         if st == 200:
             out = os.path.join(tempfile.gettempdir(), "test_result.xlsx")
             with open(out, "wb") as f: f.write(body)
-            try:
-                import openpyxl
-                wb = openpyxl.load_workbook(out)
-                check("T5 xlsx has FS_结果 sheet", "FS_结果" in wb.sheetnames, str(wb.sheetnames))
-                check("T5 xlsx has Prusa_结果 sheet", "Prusa_结果" in wb.sheetnames, str(wb.sheetnames))
-                ws = wb["FS_结果"]
-                check("T5 xlsx 128 rows in FS_结果", ws.max_row == 129, f"rows={ws.max_row}")  # 128 data + header
-                # verify header
-                hdr = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column+1)]
-                check("T5 xlsx header correct", hdr[0]=="序号" and "ΔE2000" in hdr, str(hdr))
-                # verify 序号 populated
-                check("T5 xlsx 序号 populated", ws.cell(row=2, column=1).value is not None, str(ws.cell(row=2,column=1).value))
-            except ImportError:
-                check("T5 xlsx openpyxl verify", False, "openpyxl not installed")
-    else:
-        check("T5 xlsx test file exists", False, f"not found: {xlsx_path}")
-finally:
-    srv.terminate(); srv.wait(timeout=5)
+            wb = openpyxl.load_workbook(out)
+            check("T5 xlsx has 配色结果 sheet", "配色结果" in wb.sheetnames, str(wb.sheetnames))
+            check("T5 xlsx active sheet is 配色结果", wb.active.title == "配色结果",
+                  f"active={wb.active.title}")
+            ws = wb["配色结果"]
+            check(f"T5 xlsx {N_ROWS} rows in 配色结果", ws.max_row == N_ROWS + 1, f"rows={ws.max_row}")
+            hdr = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column+1)]
+            check("T5 xlsx header correct",
+                  hdr[0]=="序号" and "FS_C%" in hdr and "FS_ΔE" in hdr and "Prusa_ΔE" in hdr
+                  and "FS预测Lab" in hdr and "Prusa预测Lab" in hdr
+                  and "FS预测CMYK" not in hdr and "Prusa预测CMYK" not in hdr,
+                  str(hdr))
+            check("T5 xlsx has 19 columns", ws.max_column == 19, f"cols={ws.max_column}")
+            check("T5 xlsx 序号 populated", ws.cell(row=2, column=1).value is not None,
+                  str(ws.cell(row=2,column=1).value))
+            # verify CMYW columns sum ~100 for a recipe row (FS side, cols 6-9)
+            r2_cmyw = [ws.cell(row=2, column=c).value for c in range(6, 10)]
+            check("T5 xlsx FS CMYW sums ~100",
+                  all(isinstance(v,(int,float)) for v in r2_cmyw) and 95 <= sum(r2_cmyw) <= 100,
+                  f"CMYW={r2_cmyw} sum={sum(r2_cmyw) if all(isinstance(v,(int,float)) for v in r2_cmyw) else '?'}")
+            # verify predicted Lab cell populated as string (FS: col 11)
+            r2_lab_pred = ws.cell(row=2, column=11).value
+            check("T5 xlsx FS pred Lab populated",
+                  isinstance(r2_lab_pred, str) and r2_lab_pred.count("/") == 2, f"Lab={r2_lab_pred!r}")
+            # verify at least one row has the best-algo green highlight
+            # (only the winning ΔE cell is highlighted: col 12 = FS_ΔE, col 19 = Prusa_ΔE)
+            green = "FFC6EFCE"
+            de_cols = (12, 19)
+            has_highlight = any(
+                ws.cell(row=r, column=c).fill.fgColor.rgb == green
+                for r in range(2, ws.max_row+1)
+                for c in de_cols
+                if ws.cell(row=r, column=c).fill and ws.cell(row=r, column=c).fill.fill_type == "solid"
+            )
+            check("T5 xlsx best-algo highlight present", has_highlight, "no green ΔE cell found")
+            # and verify the highlight is ONLY on a ΔE cell, never on recipe/Lab cells
+            non_de_cols = (set(range(6, 12)) | set(range(13, 19)))  # all non-ΔE data cols
+            no_spurious = all(
+                ws.cell(row=r, column=c).fill.fgColor.rgb != green
+                for r in range(2, ws.max_row+1)
+                for c in non_de_cols
+                if ws.cell(row=r, column=c).fill and ws.cell(row=r, column=c).fill.fill_type == "solid"
+            )
+            check("T5 xlsx highlight only on ΔE cell", no_spurious, "green found on non-ΔE cell")
+    finally:
+        srv.terminate(); srv.wait(timeout=5)
 
 # =========================================================================
 print("\n=== T6: Frontend sanity ===")

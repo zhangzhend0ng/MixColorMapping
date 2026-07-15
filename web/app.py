@@ -31,14 +31,39 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-STATIC_DIR = os.path.join(HERE, "static")
+# When frozen with PyInstaller, resources live under sys._MEIPASS (a temp dir
+# PyInstaller extracts at startup). When run from source, they live alongside
+# this file. Detect once at import time.
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    HERE = sys._MEIPASS
+    ROOT = HERE
+    STATIC_DIR = os.path.join(HERE, "static")
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    ROOT = os.path.dirname(HERE)
+    STATIC_DIR = os.path.join(HERE, "static")
 DEFAULT_PORT = 8008
 
 
 def find_cli():
-    for name in ("color_match_batch.exe", "color_match_batch"):
+    """Locate the compiled CLI binary.
+
+    Priority:
+      1. Next to the frozen exe (dev/rel override) — let users drop a freshly
+         built CLI beside the .exe without rebuilding the bundle.
+      2. Inside the PyInstaller bundle (_MEIPASS/build/color_match_batch[.exe]).
+      3. From source tree (build/color_match_batch[.exe]).
+    """
+    names = ("color_match_batch.exe", "color_match_batch")
+    # 1. beside the frozen exe
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        for name in names:
+            p = os.path.join(exe_dir, name)
+            if os.path.isfile(p):
+                return p
+    # 2/3. inside bundle or source tree
+    for name in names:
         p = os.path.join(ROOT, "build", name)
         if os.path.isfile(p):
             return p
@@ -130,9 +155,10 @@ def get_worker():
 # ---------------------------------------------------------------------------
 
 DEFAULT_PALETTE = [
-    ["#FF0000", "Red"], ["#00FF00", "Green"], ["#0000FF", "Blue"],
-    ["#FFFF00", "Yellow"], ["#00FFFF", "Cyan"], ["#FF00FF", "Magenta"],
-    ["#FFFFFF", "White"], ["#000000", "Black"],
+    ["#00FFFF", "Cyan"],    # C
+    ["#FF00FF", "Magenta"], # M
+    ["#FFFF00", "Yellow"],  # Y
+    ["#FFFFFF", "White"],   # W
 ]
 DEFAULT_TARGETS_HEX = [
     ["orange", "#FF8800"], ["teal", "#008888"], ["purple", "#8800FF"],
@@ -154,11 +180,15 @@ def _hex_fill(hex_str):
 
 
 def process_xlsx(xlsx_bytes, palette_rows, min_percent, exclude_str):
-    """Read Lab targets from 'Sheet1', batch-match with the CLI worker, write
-    FS results to 'FS_结果' and Prusa results to 'Prusa_结果' sheets.
+    """Read Lab targets from a sheet, batch-match with the CLI worker, write a
+    single combined result sheet '配色结果' with CMYW percentage columns for
+    both FS and Prusa recipes side by side, plus a green highlight on the
+    better algorithm's cells per row (lower ΔE wins).
 
     Returns the modified workbook as bytes (xlsx). Raises on error.
     Palette format: [["#hex","label"], ...] — same as the web UI uses.
+    Expects a CMYW palette (Cyan/Magenta/Yellow/White) for column mapping;
+    palette ids whose hex doesn't match a standard CMYW value are dropped.
     """
     if not HAS_OPENPYXL:
         raise RuntimeError("openpyxl not installed. Run: pip install openpyxl")
@@ -192,22 +222,27 @@ def process_xlsx(xlsx_bytes, palette_rows, min_percent, exclude_str):
 
     # ---- read targets (Lab format: 序号, L*, a*, b*) ----
     # Detect columns: find header row, then read L/a/b by header name.
+    # Header matching is whitespace/case-insensitive and ignores trailing
+    # stars, so "L*", "l*", "L", "Lab_L" all map to the L channel.
     headers = {}
     for col in range(1, targets_ws.max_column + 1):
         val = targets_ws.cell(row=1, column=col).value
         if val is not None:
-            headers[str(val).strip().lower()] = col
+            # normalized key: lowercase, no spaces, no stars
+            key = str(val).strip().lower().replace(" ", "").replace("*", "")
+            headers[key] = col
 
-    # map common header variants
     def find_col(*names):
         for n in names:
-            if n.lower() in headers: return headers[n.lower()]
+            k = n.lower().replace(" ", "").replace("*", "")
+            if k in headers:
+                return headers[k]
         return None
 
-    col_id = find_col("序号", "id", "no", "index", "#")
-    col_L = find_col("l*", "l", "l*a*b*", "lightness")
-    col_a = find_col("a*", "a")
-    col_b = find_col("b*", "b")
+    col_id = find_col("序号", "id", "no", "index", "#", "编号")
+    col_L = find_col("l", "l*", "l*a*b*", "lightness", "lab_l", "明度", "亮度")
+    col_a = find_col("a", "a*", "lab_a", "红绿")
+    col_b = find_col("b", "b*", "lab_b", "黄蓝")
 
     if col_L is None or col_a is None or col_b is None:
         # fallback: assume columns B/C/D = L/a/b (A = id)
@@ -250,60 +285,157 @@ def process_xlsx(xlsx_bytes, palette_rows, min_percent, exclude_str):
         raise RuntimeError("CLI error: %s" % result["error"])
 
     rows = result.get("rows", [])
+    if not rows:
+        raise RuntimeError(
+            "CLI returned no result rows (parsed %d target rows from sheet '%s'). "
+            "Check that L/a/b columns contain numbers."
+            % (len(targets), targets_ws.title)
+        )
 
-    # ---- write results into two new sheets ----
-    RESULT_COLUMNS = [
-        ("序号", "label"),
-        ("目标Lab_L", None), ("目标Lab_a", None), ("目标Lab_b", None),
-        ("目标_RGB", "target_hex"),
-        ("配方类型", "type"), ("耗材ID", "ids"), ("比例", "weights"),
-        ("预测_RGB", "hex"), ("预测_L", "L"), ("预测_a", "a"), ("预测_b", "b_lab"),
-        ("ΔE2000", "delta_e"),
+    # ---- build palette id → CMYW slot mapping ----
+    # The CLI returns recipes as palette-index ids ("1/3/4") + weights
+    # ("30/50/20"), aligned positionally (ids[i] ↔ weights[i], 1-based).
+    # We map each palette id to a fixed C/M/Y/W column by matching its hex
+    # against the standard subtractive primaries.
+    SLOT_HEX = {
+        "C": "00ffff",  # Cyan
+        "M": "ff00ff",  # Magenta
+        "Y": "ffff00",  # Yellow
+        "W": "ffffff",  # White
+    }
+    id_to_slot = {}
+    for pid, hex_ in enumerate(palette, 1):
+        norm = hex_.strip().lstrip("#").lower()
+        for slot, sh in SLOT_HEX.items():
+            if norm == sh:
+                id_to_slot[pid] = slot
+                break
+
+    def expand_recipe(ids_str, weights_str):
+        """Expand "1/3/4" + "30/50/20" → {"C":0,"M":30,"Y":50,"W":20}.
+        Unmapped ids (non-standard palette colors) are silently dropped."""
+        cm = {"C": 0, "M": 0, "Y": 0, "W": 0}
+        if not ids_str or not weights_str:
+            return cm
+        ids = str(ids_str).split("/")
+        wts = str(weights_str).split("/")
+        for pid_s, wt_s in zip(ids, wts):
+            try:
+                pid = int(pid_s)
+                wt = int(wt_s)
+            except ValueError:
+                continue
+            slot = id_to_slot.get(pid)
+            if slot:
+                cm[slot] += wt
+        return cm
+
+    # ---- write single combined result sheet ----
+    SHEET = "配色结果"
+    # remove old result sheets (new format, plus legacy FS_结果/Prusa_结果
+    # from earlier runs so re-uploading doesn't leave stale sheets behind).
+    for stale in (SHEET, "FS_结果", "Prusa_结果"):
+        if stale in wb.sheetnames:
+            del wb[stale]
+    ws = wb.create_sheet(SHEET)
+
+    # Columns: target info | FS (CMYW% + 预测色 + 预测Lab + ΔE)
+    #                       | Prusa (same layout)
+    # Lab 压缩成一个单元格 "L/a/b"。不输出 CMYK——那是从 RGB 算出来的派生值，
+    # 对实际混色没有参考意义，反而容易误导。
+    COLUMNS = [
+        "序号", "目标L", "目标a", "目标b", "目标色",
+        # FS
+        "FS_C%", "FS_M%", "FS_Y%", "FS_W%", "FS预测色",
+        "FS预测Lab", "FS_ΔE",
+        # Prusa
+        "Prusa_C%", "Prusa_M%", "Prusa_Y%", "Prusa_W%", "Prusa预测色",
+        "Prusa预测Lab", "Prusa_ΔE",
     ]
+    # ΔE column indices (1-based) — for the "best algorithm" highlight.
+    FS_DE_COL = 12
+    PRUSA_DE_COL = 19
 
-    for sheet_name, prefix in [("FS_结果", "fs"), ("Prusa_结果", "prusa")]:
-        # remove old sheet if re-running
-        if sheet_name in wb.sheetnames:
-            del wb[sheet_name]
-        ws = wb.create_sheet(sheet_name)
+    def fmt_lab(block):
+        """预测色 Lab → "L/a/b" 字符串（保留2位小数）。"""
+        try:
+            return "{}/{}/{}".format(
+                round(block.get("L", 0), 2),
+                round(block.get("a", 0), 2),
+                round(block.get("b_lab", 0), 2),
+            )
+        except (TypeError, ValueError):
+            return ""
 
-        # header row (bold)
-        header_font = Font(bold=True)
-        for c, (title, _) in enumerate(RESULT_COLUMNS, 1):
-            cell = ws.cell(row=1, column=c, value=title)
-            cell.font = header_font
+    header_font = Font(bold=True)
+    for c, title in enumerate(COLUMNS, 1):
+        ws.cell(row=1, column=c, value=title).font = header_font
 
-        for r_idx, row in enumerate(rows, 2):
-            block = row[prefix]
-            target = row["target"]
-            for c, (title, key) in enumerate(RESULT_COLUMNS, 1):
-                if title == "序号":
-                    val = row.get("label", "")
-                elif title == "目标Lab_L":
-                    val = next((t["L"] for t in targets if t["label"] == row["label"]), "")
-                elif title == "目标Lab_a":
-                    val = next((t["a"] for t in targets if t["label"] == row["label"]), "")
-                elif title == "目标Lab_b":
-                    val = next((t["b"] for t in targets if t["label"] == row["label"]), "")
-                elif title == "目标_RGB":
-                    val = target.get("hex", "")
-                elif key:
-                    val = block.get(key, "")
-                else:
-                    val = ""
-                cell = ws.cell(row=r_idx, column=c, value=val)
+    best_fill = PatternFill(start_color="FFC6EFCE", end_color="FFC6EFCE",
+                            fill_type="solid")  # light green
 
-            # color-fill the RGB cells (target + predicted)
-            target_hex = target.get("hex", "")
-            if target_hex:
-                ws.cell(row=r_idx, column=5).fill = _hex_fill(target_hex)
-            pred_hex = block.get("hex", "")
-            if pred_hex:
-                ws.cell(row=r_idx, column=9).fill = _hex_fill(pred_hex)
+    # target Lab lookup by label (rows preserve order, but match defensively)
+    tgt_lab = {str(t["label"]): (t["L"], t["a"], t["b"]) for t in targets}
 
-        # auto column width (rough)
-        for c in range(1, len(RESULT_COLUMNS) + 1):
-            ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 14
+    for r_idx, row in enumerate(rows, 2):
+        fs = row.get("fs", {})
+        prusa = row.get("prusa", {})
+        target = row.get("target", {})
+        label = row.get("label", "")
+        lab = tgt_lab.get(str(label), ("", "", ""))
+
+        # --- target columns (1-5) ---
+        ws.cell(row=r_idx, column=1, value=label)
+        ws.cell(row=r_idx, column=2, value=lab[0])
+        ws.cell(row=r_idx, column=3, value=lab[1])
+        ws.cell(row=r_idx, column=4, value=lab[2])
+        target_hex = target.get("hex", "")
+        c5 = ws.cell(row=r_idx, column=5, value=target_hex)
+        if target_hex:
+            c5.fill = _hex_fill(target_hex)
+
+        # --- FS columns (6-12): CMYW% | 预测色 | 预测Lab | ΔE ---
+        fs_cm = expand_recipe(fs.get("ids"), fs.get("weights"))
+        ws.cell(row=r_idx, column=6, value=fs_cm["C"])
+        ws.cell(row=r_idx, column=7, value=fs_cm["M"])
+        ws.cell(row=r_idx, column=8, value=fs_cm["Y"])
+        ws.cell(row=r_idx, column=9, value=fs_cm["W"])
+        fs_hex = fs.get("hex", "")
+        c10 = ws.cell(row=r_idx, column=10, value=fs_hex)
+        if fs_hex:
+            c10.fill = _hex_fill(fs_hex)
+        ws.cell(row=r_idx, column=11, value=fmt_lab(fs))
+        ws.cell(row=r_idx, column=12, value=fs.get("delta_e"))
+
+        # --- Prusa columns (13-19): same layout ---
+        pr_cm = expand_recipe(prusa.get("ids"), prusa.get("weights"))
+        ws.cell(row=r_idx, column=13, value=pr_cm["C"])
+        ws.cell(row=r_idx, column=14, value=pr_cm["M"])
+        ws.cell(row=r_idx, column=15, value=pr_cm["Y"])
+        ws.cell(row=r_idx, column=16, value=pr_cm["W"])
+        pr_hex = prusa.get("hex", "")
+        c17 = ws.cell(row=r_idx, column=17, value=pr_hex)
+        if pr_hex:
+            c17.fill = _hex_fill(pr_hex)
+        ws.cell(row=r_idx, column=18, value=fmt_lab(prusa))
+        ws.cell(row=r_idx, column=19, value=prusa.get("delta_e"))
+
+        # --- highlight only the better algorithm's ΔE cell (lower wins) ---
+        fs_de = fs.get("delta_e")
+        pr_de = prusa.get("delta_e")
+        if isinstance(fs_de, (int, float)) and isinstance(pr_de, (int, float)):
+            if fs_de < pr_de:
+                ws.cell(row=r_idx, column=FS_DE_COL).fill = best_fill
+            elif pr_de < fs_de:
+                ws.cell(row=r_idx, column=PRUSA_DE_COL).fill = best_fill
+        # (equal or non-numeric → no highlight)
+
+    # auto column width (rough)
+    for c in range(1, len(COLUMNS) + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 10
+
+    # Open the result sheet directly (not the unchanged targets sheet).
+    wb.active = wb[SHEET]
 
     # ---- serialize workbook to bytes ----
     out = io.BytesIO()
