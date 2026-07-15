@@ -12,6 +12,7 @@ Then open http://localhost:8008
 Requires build/color_match_batch[.exe] to be built first (run build.sh).
 """
 import atexit
+import io
 import json
 import os
 import socketserver
@@ -20,6 +21,15 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import unquote
+
+# openpyxl is the only third-party dependency (for .xlsx read/write). Graceful
+# degradation: the CSV/web-edit path works without it; only xlsx upload needs it.
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font, Alignment
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -131,6 +141,177 @@ DEFAULT_TARGETS_HEX = [
 
 
 # ---------------------------------------------------------------------------
+# XLSX processing: read Lab targets from a sheet, batch-match, write results
+# back into new sheets on the same workbook.
+# ---------------------------------------------------------------------------
+
+def _hex_fill(hex_str):
+    """openpyxl PatternFill from a #rrggbb string (for colored result cells)."""
+    h = hex_str.lstrip("#")
+    if len(h) >= 6:
+        return PatternFill(start_color="FF" + h[:6], end_color="FF" + h[:6], fill_type="solid")
+    return None
+
+
+def process_xlsx(xlsx_bytes, palette_rows, min_percent, exclude_str):
+    """Read Lab targets from 'Sheet1', batch-match with the CLI worker, write
+    FS results to 'FS_结果' and Prusa results to 'Prusa_结果' sheets.
+
+    Returns the modified workbook as bytes (xlsx). Raises on error.
+    Palette format: [["#hex","label"], ...] — same as the web UI uses.
+    """
+    if not HAS_OPENPYXL:
+        raise RuntimeError("openpyxl not installed. Run: pip install openpyxl")
+    if not palette_rows or len(palette_rows) < 2:
+        raise RuntimeError("palette needs >= 2 colors")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+
+    # ---- find the targets sheet: prefer "Sheet1", else first non-empty sheet ----
+    targets_ws = None
+    for name in ["Sheet1", "sheet1", "Targets", "目标色"]:
+        if name in wb.sheetnames:
+            targets_ws = wb[name]
+            break
+    if targets_ws is None:
+        # pick the sheet with the most rows
+        targets_ws = max(wb.worksheets, key=lambda ws: ws.max_row)
+    if targets_ws.max_row < 2:
+        raise RuntimeError("targets sheet '%s' appears empty" % targets_ws.title)
+
+    # ---- parse palette rows → [hex or label, hex] ----
+    palette = []
+    for row in palette_rows:
+        hex_val = None
+        if row and row[0] and str(row[0]).startswith("#"):
+            hex_val = row[0]
+        elif len(row) > 1 and row[1] and str(row[1]).startswith("#"):
+            hex_val = row[1]
+        if hex_val:
+            palette.append(hex_val)
+
+    # ---- read targets (Lab format: 序号, L*, a*, b*) ----
+    # Detect columns: find header row, then read L/a/b by header name.
+    headers = {}
+    for col in range(1, targets_ws.max_column + 1):
+        val = targets_ws.cell(row=1, column=col).value
+        if val is not None:
+            headers[str(val).strip().lower()] = col
+
+    # map common header variants
+    def find_col(*names):
+        for n in names:
+            if n.lower() in headers: return headers[n.lower()]
+        return None
+
+    col_id = find_col("序号", "id", "no", "index", "#")
+    col_L = find_col("l*", "l", "l*a*b*", "lightness")
+    col_a = find_col("a*", "a")
+    col_b = find_col("b*", "b")
+
+    if col_L is None or col_a is None or col_b is None:
+        # fallback: assume columns B/C/D = L/a/b (A = id)
+        col_id, col_L, col_a, col_b = 1, 2, 3, 4
+
+    # collect target rows: {label, L, a, b}
+    targets = []
+    for r in range(2, targets_ws.max_row + 1):
+        L = targets_ws.cell(row=r, column=col_L).value
+        a = targets_ws.cell(row=r, column=col_a).value
+        b = targets_ws.cell(row=r, column=col_b).value
+        label = targets_ws.cell(row=r, column=col_id).value if col_id else r - 1
+        if L is None or a is None or b is None:
+            continue
+        try:
+            targets.append({"label": str(label), "L": float(L), "a": float(a), "b": float(b)})
+        except (ValueError, TypeError):
+            continue
+
+    if not targets:
+        raise RuntimeError("no valid Lab target rows found in '%s'" % targets_ws.title)
+
+    # ---- run batch match via the persistent CLI worker ----
+    worker = get_worker()
+    if worker is None:
+        raise RuntimeError("CLI worker not available")
+
+    # CLI expects targets as [["label", L, a, b], ...] in "lab" format
+    target_rows = [[t["label"], str(t["L"]), str(t["a"]), str(t["b"])] for t in targets]
+    request = {
+        "palette": palette_rows,
+        "targets": target_rows,
+        "format": "lab",
+        "rgb_scale": "auto",
+        "min_percent": min_percent if min_percent is not None else 0,
+        "exclude": exclude_str or "",
+    }
+    result = worker.query(request)
+    if "error" in result and "rows" not in result:
+        raise RuntimeError("CLI error: %s" % result["error"])
+
+    rows = result.get("rows", [])
+
+    # ---- write results into two new sheets ----
+    RESULT_COLUMNS = [
+        ("序号", "label"),
+        ("目标Lab_L", None), ("目标Lab_a", None), ("目标Lab_b", None),
+        ("目标_RGB", "target_hex"),
+        ("配方类型", "type"), ("耗材ID", "ids"), ("比例", "weights"),
+        ("预测_RGB", "hex"), ("预测_L", "L"), ("预测_a", "a"), ("预测_b", "b_lab"),
+        ("ΔE2000", "delta_e"),
+    ]
+
+    for sheet_name, prefix in [("FS_结果", "fs"), ("Prusa_结果", "prusa")]:
+        # remove old sheet if re-running
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+
+        # header row (bold)
+        header_font = Font(bold=True)
+        for c, (title, _) in enumerate(RESULT_COLUMNS, 1):
+            cell = ws.cell(row=1, column=c, value=title)
+            cell.font = header_font
+
+        for r_idx, row in enumerate(rows, 2):
+            block = row[prefix]
+            target = row["target"]
+            for c, (title, key) in enumerate(RESULT_COLUMNS, 1):
+                if title == "序号":
+                    val = row.get("label", "")
+                elif title == "目标Lab_L":
+                    val = next((t["L"] for t in targets if t["label"] == row["label"]), "")
+                elif title == "目标Lab_a":
+                    val = next((t["a"] for t in targets if t["label"] == row["label"]), "")
+                elif title == "目标Lab_b":
+                    val = next((t["b"] for t in targets if t["label"] == row["label"]), "")
+                elif title == "目标_RGB":
+                    val = target.get("hex", "")
+                elif key:
+                    val = block.get(key, "")
+                else:
+                    val = ""
+                cell = ws.cell(row=r_idx, column=c, value=val)
+
+            # color-fill the RGB cells (target + predicted)
+            target_hex = target.get("hex", "")
+            if target_hex:
+                ws.cell(row=r_idx, column=5).fill = _hex_fill(target_hex)
+            pred_hex = block.get("hex", "")
+            if pred_hex:
+                ws.cell(row=r_idx, column=9).fill = _hex_fill(pred_hex)
+
+        # auto column width (rough)
+        for c in range(1, len(RESULT_COLUMNS) + 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 14
+
+    # ---- serialize workbook to bytes ----
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), len(rows)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -193,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_match(raw)
         elif path == "/api/export":
             self._handle_export(raw)
+        elif path == "/api/xlsx/run":
+            self._handle_xlsx(raw)
         else:
             self._send(404, "not found")
 
@@ -235,6 +418,45 @@ class Handler(BaseHTTPRequestHandler):
         # (see index.html exportCsv). This endpoint is kept for compatibility
         # but delegates to the same worker.
         self._handle_match(raw_body)
+
+    def _handle_xlsx(self, raw_body):
+        """Upload a .xlsx, batch-match its Lab targets with the current palette,
+        write FS/Prusa results into new sheets, return the modified .xlsx.
+
+        Request is multipart/form-data OR JSON with base64 file content.
+        We accept JSON for simplicity: {xlsx: "<base64>", palette: [...],
+        min_percent: N, exclude: "..."}.
+        """
+        try:
+            import base64
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json({"error": "bad request: %s" % e}, 400)
+            return
+
+        xlsx_b64 = payload.get("xlsx")
+        if not xlsx_b64:
+            self._send_json({"error": "missing 'xlsx' field (base64-encoded file)"}, 400)
+            return
+        try:
+            xlsx_bytes = base64.b64decode(xlsx_b64)
+        except Exception as e:
+            self._send_json({"error": "bad base64: %s" % e}, 400)
+            return
+
+        palette = payload.get("palette") or DEFAULT_PALETTE
+        min_percent = payload.get("min_percent")
+        exclude = payload.get("exclude") or ""
+
+        try:
+            data, count = process_xlsx(xlsx_bytes, palette, min_percent, exclude)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+
+        # Return the xlsx bytes directly for download.
+        self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                   extra_headers={"Content-Disposition": 'attachment; filename="results.xlsx"'})
 
 
 # ---------------------------------------------------------------------------

@@ -142,13 +142,19 @@
   </div>
 
   <!-- ACTIONS -->
-  <div class="panel" style="margin-top:16px; display:flex; gap:10px; align-items:center;">
+  <div class="panel" style="margin-top:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
     <button class="btn btn-primary" onclick="recompute()">立即重算</button>
     <button class="btn" onclick="exportCsv()">导出 results.csv</button>
     <label class="sub" style="display:flex;align-items:center;gap:4px;color:var(--muted);font-size:12px;">
       <input type="checkbox" id="autoRecompute" checked style="width:auto"> 编辑后自动重算
     </label>
-    <span id="status" class="status-bar" style="flex:1; margin:0;">就绪</span>
+    <span style="width:1px;height:24px;background:var(--border);margin:0 4px;"></span>
+    <label class="btn" style="cursor:pointer;">
+      处理 xlsx (上传 → 匹配 → 下载)
+      <input type="file" id="xlsxInput" accept=".xlsx,.xls" style="display:none" onchange="uploadXlsx(this)">
+    </label>
+    <span id="xlsxStatus" class="sub" style="color:var(--muted);font-size:12px;"></span>
+    <span id="status" class="status-bar" style="flex:1; margin:0; min-width:200px;">就绪</span>
   </div>
 
   <!-- RESULTS -->
@@ -466,6 +472,65 @@ function exportCsv() {
   a.click();
   URL.revokeObjectURL(a.href);
   setStatus('已导出 results.csv (' + lastData.rows.length + ' 行)');
+}
+
+// ---- xlsx upload/download ----
+// Upload a .xlsx with Lab targets (Sheet1), match with current palette, get
+// back a .xlsx with FS_结果 / Prusa_结果 sheets filled in.
+async function uploadXlsx(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const xlsxStatus = document.getElementById('xlsxStatus');
+  xlsxStatus.textContent = '读取 ' + file.name + ' ...';
+  setStatus('<span class="spinner"></span> 正在处理 ' + file.name + ' ...');
+
+  try {
+    // read file as base64
+    const b64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+    const body = {
+      xlsx: b64,
+      palette: collectPalette(),
+      min_percent: parseInt(document.getElementById('minPctInput').value) || 0,
+      exclude: document.getElementById('excludeInput').value.trim(),
+    };
+
+    const t0 = performance.now();
+    const r = await fetch('/api/xlsx/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({error: r.status}));
+      throw new Error(d.error || ('HTTP ' + r.status));
+    }
+
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    // output filename: original name + _结果.xlsx
+    const outName = file.name.replace(/\.xlsx$/i, '') + '_结果.xlsx';
+    a.download = outName;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    xlsxStatus.textContent = '✓ ' + elapsed + 's → ' + outName;
+    setStatus('xlsx 处理完成 (' + elapsed + 's)，已下载 ' + outName);
+  } catch(e) {
+    xlsxStatus.textContent = '✗ 失败';
+    setStatus('xlsx 处理失败: ' + e.message, true);
+  } finally {
+    // reset input so the same file can be re-selected
+    input.value = '';
+  }
 }
 
 // ---- utils ----
